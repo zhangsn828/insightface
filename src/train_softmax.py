@@ -93,6 +93,7 @@ def parse_args():
   parser.add_argument('--max-steps', type=int, default=0, help='max training batches')
   parser.add_argument('--end-epoch', type=int, default=100000, help='training epoch size.')
   parser.add_argument('--network', default='r50', help='specify network')
+  parser.add_argument('--image-size', default='112,112', help='specify input image height and width')
   parser.add_argument('--version-se', type=int, default=0, help='whether to use se in network')
   parser.add_argument('--version-input', type=int, default=1, help='network input config')
   parser.add_argument('--version-output', type=str, default='E', help='network embedding output config')
@@ -123,7 +124,10 @@ def parse_args():
   parser.add_argument('--scale', type=float, default=0.9993, help='param for sphere')
   parser.add_argument('--rand-mirror', type=int, default=1, help='if do random mirror in training')
   parser.add_argument('--cutoff', type=int, default=0, help='cut off aug')
+  parser.add_argument('--color', type=int, default=0, help='color jittering aug')
+  parser.add_argument('--images-filter', type=int, default=0, help='minimum images per identity filter')
   parser.add_argument('--target', type=str, default='lfw,cfp_fp,agedb_30', help='verification targets')
+  parser.add_argument('--ce-loss', default=False, action='store_true', help='if output ce loss')
   args = parser.parse_args()
   return args
 
@@ -269,9 +273,79 @@ def get_symbol(args, arg_params, aux_params):
         gt_one_hot = mx.sym.one_hot(gt_label, depth = args.num_classes, on_value = 1.0, off_value = 0.0)
         body = mx.sym.broadcast_mul(gt_one_hot, diff)
         fc7 = fc7+body
+  elif args.loss_type==6:
+    s = args.margin_s
+    m = args.margin_m
+    assert s>0.0
+    _weight = mx.symbol.L2Normalization(_weight, mode='instance')
+    nembedding = mx.symbol.L2Normalization(embedding, mode='instance', name='fc1n')*s
+    fc7 = mx.sym.FullyConnected(data=nembedding, weight = _weight, no_bias = True, num_hidden=args.num_classes, name='fc7')
+    zy = mx.sym.pick(fc7, gt_label, axis=1)
+    cos_t = zy/s
+    t = mx.sym.arccos(cos_t)
+    intra_loss = t/np.pi
+    intra_loss = mx.sym.mean(intra_loss)
+    #intra_loss = mx.sym.exp(cos_t*-1.0)
+    intra_loss = mx.sym.MakeLoss(intra_loss, name='intra_loss', grad_scale = 1)
+    if m>0.0:
+      t = t+m
+      body = mx.sym.cos(t)
+      new_zy = body*s
+      diff = new_zy - zy
+      diff = mx.sym.expand_dims(diff, 1)
+      gt_one_hot = mx.sym.one_hot(gt_label, depth = args.num_classes, on_value = 1.0, off_value = 0.0)
+      body = mx.sym.broadcast_mul(gt_one_hot, diff)
+      fc7 = fc7+body
+  elif args.loss_type==7:
+    s = args.margin_s
+    m = args.margin_m
+    assert s>0.0
+    _weight = mx.symbol.L2Normalization(_weight, mode='instance')
+    nembedding = mx.symbol.L2Normalization(embedding, mode='instance', name='fc1n')*s
+    fc7 = mx.sym.FullyConnected(data=nembedding, weight = _weight, no_bias = True, num_hidden=args.num_classes, name='fc7')
+    zy = mx.sym.pick(fc7, gt_label, axis=1)
+    cos_t = zy/s
+    t = mx.sym.arccos(cos_t)
+    intra_loss = t/np.pi
+    intra_loss = mx.sym.MakeLoss(intra_loss, name='intra_loss', grad_scale = 0.1)
+    #idx = mx.sym.arange(0, args.num_classes)
+    #idx = mx.sym.random.shuffle(idx)
+    #idx = mx.sym.slice(data=idx, begin=0, end=100)
+    #counter_weight = mx.sym.take(_weight, indices=idx, axis=1)
+    #counter_weight = mx.sym.pick(_weight, gt_label, axis=1)
+    counter_weight = mx.sym.take(_weight, gt_label, axis=1)
+    counter_cos = mx.sym.dot(counter_weight, _weight, transpose_a=True)
+    counter_angle = mx.sym.arccos(counter_cos)
+    inter_loss = counter_angle/np.pi #[0,1]
+    inter_loss = inter_loss*-1.0 # [-1,0]
+    inter_loss = inter_loss+1.0 # [0,1]
+    inter_loss = mx.sym.mean(inter_loss)
+    inter_loss = mx.sym.MakeLoss(inter_loss, name='inter_loss', grad_scale = 0.1)
+    if m>0.0:
+      t = t+m
+      body = mx.sym.cos(t)
+      new_zy = body*s
+      diff = new_zy - zy
+      diff = mx.sym.expand_dims(diff, 1)
+      gt_one_hot = mx.sym.one_hot(gt_label, depth = args.num_classes, on_value = 1.0, off_value = 0.0)
+      body = mx.sym.broadcast_mul(gt_one_hot, diff)
+      fc7 = fc7+body
   out_list = [mx.symbol.BlockGrad(embedding)]
   softmax = mx.symbol.SoftmaxOutput(data=fc7, label = gt_label, name='softmax', normalization='valid')
   out_list.append(softmax)
+  if args.loss_type==6:
+    out_list.append(intra_loss)
+  if args.loss_type==7:
+    out_list.append(inter_loss)
+    #out_list.append(intra_loss)
+  if args.ce_loss:
+    #ce_loss = mx.symbol.softmax_cross_entropy(data=fc7, label = gt_label, name='ce_loss')/args.per_batch_size
+    body = mx.symbol.SoftmaxActivation(data=fc7)
+    body = mx.symbol.log(body)
+    _label = mx.sym.one_hot(gt_label, depth = args.num_classes, on_value = -1.0, off_value = 0.0)
+    body = body*_label
+    ce_loss = mx.symbol.sum(body)/args.per_batch_size
+    out_list.append(mx.symbol.BlockGrad(ce_loss))
   out = mx.symbol.Group(out_list)
   return (out, arg_params, aux_params)
 
@@ -308,7 +382,10 @@ def train_net(args):
     path_imglist = None
     prop = face_image.load_property(data_dir)
     args.num_classes = prop.num_classes
-    image_size = prop.image_size
+    #image_size = prop.image_size
+    image_size = [int(x) for x in args.image_size.split(',')]
+    assert len(image_size)==2
+    assert image_size[0]==image_size[1]
     args.image_h = image_size[0]
     args.image_w = image_size[1]
     print('image_size', image_size)
@@ -332,14 +409,14 @@ def train_net(args):
       arg_params = None
       aux_params = None
       sym, arg_params, aux_params = get_symbol(args, arg_params, aux_params)
+      if args.network[0]=='s':
+        data_shape_dict = {'data' : (args.per_batch_size,)+data_shape}
+        spherenet.init_weights(sym, data_shape_dict, args.num_layers)
     else:
       vec = args.pretrained.split(',')
       print('loading', vec)
       _, arg_params, aux_params = mx.model.load_checkpoint(vec[0], int(vec[1]))
       sym, arg_params, aux_params = get_symbol(args, arg_params, aux_params)
-    if args.network[0]=='s':
-      data_shape_dict = {'data' : (args.per_batch_size,)+data_shape}
-      spherenet.init_weights(sym, data_shape_dict, args.num_layers)
 
     #label_name = 'softmax_label'
     #label_shape = (args.batch_size,)
@@ -357,13 +434,15 @@ def train_net(args):
         rand_mirror          = args.rand_mirror,
         mean                 = mean,
         cutoff               = args.cutoff,
+        color_jittering      = args.color,
+        images_filter        = args.images_filter,
     )
 
-    if args.loss_type<10:
-      _metric = AccMetric()
-    else:
-      _metric = LossValueMetric()
-    eval_metrics = [mx.metric.create(_metric)]
+    metric1 = AccMetric()
+    eval_metrics = [mx.metric.create(metric1)]
+    if args.ce_loss:
+      metric2 = LossValueMetric()
+      eval_metrics.append( mx.metric.create(metric2) )
 
     if args.network[0]=='r' or args.network[0]=='y':
       initializer = mx.init.Xavier(rnd_type='gaussian', factor_type="out", magnitude=2) #resnet style
@@ -434,20 +513,33 @@ def train_net(args):
         save_step[0]+=1
         msave = save_step[0]
         do_save = False
+        is_highest = False
         if len(acc_list)>0:
-          lfw_score = acc_list[0]
-          if lfw_score>highest_acc[0]:
-            highest_acc[0] = lfw_score
-            if lfw_score>=0.998:
-              do_save = True
+          #lfw_score = acc_list[0]
+          #if lfw_score>highest_acc[0]:
+          #  highest_acc[0] = lfw_score
+          #  if lfw_score>=0.998:
+          #    do_save = True
+          score = sum(acc_list)
           if acc_list[-1]>=highest_acc[-1]:
+            if acc_list[-1]>highest_acc[-1]:
+              is_highest = True
+            else:
+              if score>=highest_acc[0]:
+                is_highest = True
+                highest_acc[0] = score
             highest_acc[-1] = acc_list[-1]
-            if lfw_score>=0.99:
-              do_save = True
+            #if lfw_score>=0.99:
+            #  do_save = True
+        if is_highest:
+          do_save = True
         if args.ckpt==0:
           do_save = False
-        elif args.ckpt>1:
+        elif args.ckpt==2:
           do_save = True
+        elif args.ckpt==3:
+          msave = 1
+
         if do_save:
           print('saving', msave)
           arg, aux = model.get_params()
